@@ -281,3 +281,69 @@ Build in this order. Later phases depend on earlier artifacts (a pruned ONNX mod
 | MorphNet | Pruning method that uses BatchNorm γ to drop unused channels |
 | QAT | Quantization-aware training: train as if weights were INT8 |
 | HID injection | Fake keyboard/mouse events at OS level (`SendInput` / `uinput`) |
+     ## 7. Step-by-Step Execution Protocol (Agent Workflow)
+
+When the user gives commands like "Выполни шаг 1" or "Переходи к шагу 2", execute strictly according to these atomic step definitions:
+
+### [STEP 1] Data Generation & Font Parsing
+* **Target Files:** `ml_pipeline/font_sampler.py`, `ml_pipeline/augmentor.py`, `ml_pipeline/dataset.py`
+* **Task Contract:**
+  1. Load system/bundled TTF fonts for Latin (A-Z, 0-9), Cyrillic (А-Я), and Hebrew.
+  2. Extract continuous contour paths using `freetype-py` or `fonttools`.
+  3. Resample each glyph contour to exactly 64 equidistant 2D points via cumulative arc-length.
+  4. Generate synthetic kinematically distorted variations (shear, velocity changes, human hand tremor, random scale).
+  5. Compute 4-feature vector per step: `[dx, dy, sin(theta), cos(theta)]` -> tensor shape `(63, 4)`.
+* **Acceptance Criteria:** A runnable script that outputs `data/synthetic/synthetic_dataset.npz` and displays a matplotlib verification plot of 5 random characters.
+
+---
+
+### [STEP 2] Neural Architecture & Baseline Training
+* **Target Files:** `ml_pipeline/model.py`, `ml_pipeline/train.py`, `ml_pipeline/evaluate.py`
+* **Task Contract:**
+  1. Implement PyTorch `1D-CNN + BiGRU + Temporal Attention` model (<70k parameters).
+  2. Build training loop with AdamW, CrossEntropyLoss, and Cosine Annealing learning rate.
+  3. Validate model convergence on synthetic test split (target: >98% top-1 accuracy).
+* **Acceptance Criteria:** Model weights saved to `data/checkpoints/baseline_model.pth` with evaluation metrics logged in terminal.
+
+---
+
+### [STEP 3] MorphNet Structural Pruning & INT8 Export
+* **Target Files:** `ml_pipeline/morphnet_pruner.py`, `ml_pipeline/export_onnx.py`
+* **Task Contract:**
+  1. Apply L1 regularization penalty to BatchNorm scaling factors ($\gamma$).
+  2. Prune channels where $|\gamma| < \text{threshold}$ and rebuild compact network.
+  3. Fine-tune pruned network for 5 epochs.
+  4. Export to ONNX with Dynamic INT8 quantization (`model_pruned_int8.onnx`).
+* **Acceptance Criteria:** Output file `model_pruned_int8.onnx` has size $\le 40\text{ KB}$ and top-1 accuracy drops by $< 0.5\%$.
+
+---
+
+### [STEP 4] Predictive Autocompletion Engine (C++)
+* **Target Files:** `src/autocompletion/trie_node.hpp`, `src/autocompletion/trie_engine.hpp/.cpp`, `src/autocompletion/ghost_text_manager.hpp/.cpp`
+* **Task Contract:**
+  1. Build zero-allocation prefix Trie loaded from sorted word frequency dictionaries.
+  2. Implement `lookup_top1(prefix)` with latency $< 0.3\text{ ms}$.
+  3. Manage active prefix buffer and emit passive Ghost Text suggestion strings.
+  4. Implement commit logic for Tab micro-gesture.
+* **Acceptance Criteria:** `tests/test_trie.cpp` passes all benchmark assertions.
+
+---
+
+### [STEP 5] Vision Capture, Filter & 5x5cm Micro-Box
+* **Target Files:** `src/vision/one_euro_filter.hpp/.cpp`, `src/vision/hand_tracker.hpp/.cpp`, `src/recognition/preprocessor.hpp/.cpp`
+* **Task Contract:**
+  1. Initialize camera capture and extract index finger tip landmarks.
+  2. Apply adaptive $1€$ filter to coordinates for zero-jitter tracking.
+  3. Anchor virtual $5\text{ cm} \times 5\text{ cm}$ interaction micro-box.
+  4. Buffer trajectory points during gesture and normalize to 64 equidistant points on stroke release.
+* **Acceptance Criteria:** Smooth real-time coordinate feed with zero jitter when still and sub-10ms response on fast flicks.
+
+---
+
+### [STEP 6] FSM Arbiter & OS Native Injection
+* **Target Files:** `src/recognition/state_machine.hpp/.cpp`, `src/platform/input_injector_win.cpp`, `src/main.cpp`
+* **Task Contract:**
+  1. Implement FSM for mode switching: Pointer (1 finger), Gestures/Macros (palm), In-Place Writing (in-box).
+  2. Detect Tab micro-gesture (sharp right flick $< 40\text{ ms}$).
+  3. Inject text and mouse events directly into OS via Win32 `SendInput` / Linux `uinput`.
+* **Acceptance Criteria:** Fully integrated executable running background loop under $200\text{ MB}$ RAM and $< 15\text{ ms}$ total latency.

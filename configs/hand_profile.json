@@ -1,0 +1,14 @@
+{
+  "palm_base_scale": 0.20074884085744577,
+  "index_length": 0.15735231769433752,
+  "thumb_reach": 0.23401694187864736,
+  "pinch_threshold_lmb": 0.060224652257233724,
+  "pinch_threshold_rmb": 0.060224652257233724,
+  "fist_closed_threshold": 0.070262094300106,
+  "natural_jitter_std": 0.0314236587519809,
+  "active_margin_lo": 0.15,
+  "active_margin_hi": 0.85,
+  "one_euro_min_cutoff": 0.015,
+  "one_euro_beta": 0.7,
+  "calibrated_at": 1786915343.0916393
+}

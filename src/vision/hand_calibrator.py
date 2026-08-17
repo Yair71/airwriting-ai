@@ -126,9 +126,9 @@ def compute_profile_from_landmarks(samples: list[np.ndarray]) -> HandProfile:
     tip_xy: list[tuple[float, float]] = []
 
     for lm in samples:
-        palms.append(float(np.linalg.norm(lm[MIDDLE_MCP, :2] - lm[WRIST, :2])))
-        indexes.append(float(np.linalg.norm(lm[INDEX_TIP, :2] - lm[INDEX_MCP, :2])))
-        thumbs.append(float(np.linalg.norm(lm[THUMB_TIP, :2] - lm[WRIST, :2])))
+        palms.append(float(np.linalg.norm(lm[MIDDLE_MCP, :3] - lm[WRIST, :3])))
+        indexes.append(float(np.linalg.norm(lm[INDEX_TIP, :3] - lm[INDEX_MCP, :3])))
+        thumbs.append(float(np.linalg.norm(lm[THUMB_TIP, :3] - lm[WRIST, :3])))
         tip_xy.append((float(lm[INDEX_TIP, 0]), float(lm[INDEX_TIP, 1])))
 
     palm = float(np.mean(palms))

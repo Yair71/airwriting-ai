@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import ctypes
 import sys
-import time
 from ctypes import wintypes
 
 if sys.platform != "win32":  # pragma: no cover
     raise ImportError("win_injector is Windows-only")
 
 user32 = ctypes.windll.user32
+user32.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
+user32.SetCursorPos.restype = wintypes.BOOL
 
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
@@ -37,6 +38,14 @@ VK_SPACE = 0x20
 WHEEL_DELTA = 120
 
 ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+user32.mouse_event.argtypes = (
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    ULONG_PTR,
+)
+user32.mouse_event.restype = None
 
 
 class MOUSEINPUT(ctypes.Structure):
@@ -98,12 +107,20 @@ def _key_vk(vk: int, up: bool = False) -> INPUT:
     return inp
 
 
-def _key_unicode(char: str, up: bool = False) -> INPUT:
+def _key_unicode_unit(code_unit: int, up: bool = False) -> INPUT:
     inp = INPUT()
     inp.type = INPUT_KEYBOARD
     flags = KEYEVENTF_UNICODE | (KEYEVENTF_KEYUP if up else 0)
-    inp.union.ki = KEYBDINPUT(0, ord(char), flags, 0, 0)
+    inp.union.ki = KEYBDINPUT(0, int(code_unit), flags, 0, 0)
     return inp
+
+
+def _utf16_code_units(text: str) -> list[int]:
+    encoded = text.encode("utf-16-le", errors="surrogatepass")
+    return [
+        int.from_bytes(encoded[index : index + 2], "little")
+        for index in range(0, len(encoded), 2)
+    ]
 
 
 class WinInjector:
@@ -125,26 +142,36 @@ class WinInjector:
         self._screen_w = max(user32.GetSystemMetrics(0), 1)
         self._screen_h = max(user32.GetSystemMetrics(1), 1)
 
+    def screen_size(self) -> tuple[int, int]:
+        return self._screen_w, self._screen_h
+
+    def move_pointer(self, x: int, y: int) -> None:
+        """Set an absolute primary-screen pixel position through user32."""
+        px = min(max(int(x), 0), self._screen_w - 1)
+        py = min(max(int(y), 0), self._screen_h - 1)
+        if not user32.SetCursorPos(px, py):
+            raise ctypes.WinError()
+
     def move_pointer_norm(self, x: float, y: float) -> None:
-        """Normalized [0,1] → absolute mouse on primary virtual desktop."""
-        self.refresh_metrics()
+        """Normalized [0,1] -> direct SetCursorPos on the primary screen."""
         x = min(max(float(x), 0.0), 1.0)
         y = min(max(float(y), 0.0), 1.0)
-        ax = int(x * 65535.0)
-        ay = int(y * 65535.0)
-        _send([_mouse_input(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, ax, ay)])
+        self.move_pointer(
+            int(round(x * (self._screen_w - 1))),
+            int(round(y * (self._screen_h - 1))),
+        )
 
     def left_down(self) -> None:
-        _send([_mouse_input(MOUSEEVENTF_LEFTDOWN)])
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
 
     def left_up(self) -> None:
-        _send([_mouse_input(MOUSEEVENTF_LEFTUP)])
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
     def right_down(self) -> None:
-        _send([_mouse_input(MOUSEEVENTF_RIGHTDOWN)])
+        user32.mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
 
     def right_up(self) -> None:
-        _send([_mouse_input(MOUSEEVENTF_RIGHTUP)])
+        user32.mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
 
     def left_click(self) -> None:
         """Instant LMB click (down + up). Prefer left_down/left_up for pinch hysteresis."""
@@ -160,7 +187,13 @@ class WinInjector:
         """Inject MOUSEEVENTF_WHEEL (notches * WHEEL_DELTA)."""
         if notches == 0:
             return
-        _send([_mouse_input(MOUSEEVENTF_WHEEL, data=int(notches) * WHEEL_DELTA)])
+        user32.mouse_event(
+            MOUSEEVENTF_WHEEL,
+            0,
+            0,
+            ctypes.c_uint32(int(notches) * WHEEL_DELTA).value,
+            0,
+        )
 
     def tap_vk(self, vk: int) -> None:
         _send([_key_vk(vk, up=False), _key_vk(vk, up=True)])
@@ -197,8 +230,21 @@ class WinInjector:
             elif ch == "\b":
                 self.tap_vk(VK_BACK)
             else:
-                _send([_key_unicode(ch, up=False), _key_unicode(ch, up=True)])
-            time.sleep(0.001)
+                self.send_unicode_char(ch)
+
+    def send_unicode_char(self, text: str) -> None:
+        """Inject UTF-16 code units directly, bypassing keyboard layout."""
+        if not self._allow_text() or not text:
+            return
+        inputs: list[INPUT] = []
+        for code_unit in _utf16_code_units(text):
+            inputs.extend(
+                [
+                    _key_unicode_unit(code_unit, up=False),
+                    _key_unicode_unit(code_unit, up=True),
+                ]
+            )
+        _send(inputs)
 
     def inject_label(self, label: str) -> None:
         if label == "SPACE":

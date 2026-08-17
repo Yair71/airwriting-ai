@@ -1,4 +1,4 @@
-"""In-air stroke collector: PEN_DOWN / buffer / PEN_UP + neon trail render."""
+"""Discrete air-writing strokes with an atomic 400 ms letter clutch."""
 
 from __future__ import annotations
 
@@ -9,111 +9,104 @@ from enum import Enum
 import cv2
 import numpy as np
 
+from src.vision.bone_angles import (
+    Finger,
+    finger_angle_degrees,
+    finger_curled,
+    finger_extended,
+    palm_scale,
+)
 from src.vision.hand_calibrator import HandProfile, default_profile, load_profile
 from src.vision.one_euro import OneEuroFilter2D
 
-# Neon green #00FF66 → OpenCV BGR
 NEON_CORE = (102, 255, 0)
 NEON_GLOW = (60, 180, 0)
 NEON_SOFT = (40, 120, 0)
 
 INDEX_TIP = 8
-INDEX_PIP = 6
-MIDDLE_TIP = 12
-MIDDLE_PIP = 10
-RING_TIP = 16
-RING_PIP = 14
-PINKY_TIP = 20
-PINKY_PIP = 18
-WRIST = 0
-MIDDLE_MCP = 9
 
-DWELL_S = 0.160
-MIN_POINTS = 8
-FADE_S = 0.450
-DWELL_SPEED = 0.08
+COMMIT_DELAY_S = 0.400
 
 
 class PenState(str, Enum):
     UP = "UP"
     DOWN = "DOWN"
-    FADING = "FADING"
 
 
 def live_hand_scale(lm: np.ndarray) -> float:
-    return max(float(np.linalg.norm(lm[MIDDLE_MCP, :2] - lm[WRIST, :2])), 1e-6)
+    return palm_scale(lm)
 
 
 def is_index_writing_pose(lm: np.ndarray) -> bool:
-    """Index tip (8) higher than PIP (6); middle/ring/pinky relaxed (not raised)."""
+    """Stateless PEN_DOWN entry test; modal hysteresis lives in the controller."""
     if lm is None or lm.shape[0] < 21:
         return False
-    # Image Y grows downward — "higher" means smaller y.
-    if float(lm[INDEX_TIP, 1]) >= float(lm[INDEX_PIP, 1]):
-        return False
-    for tip, pip in ((MIDDLE_TIP, MIDDLE_PIP), (RING_TIP, RING_PIP), (PINKY_TIP, PINKY_PIP)):
-        if float(lm[tip, 1]) < float(lm[pip, 1]) - 0.012:
-            return False
-    return True
+    return finger_angle_degrees(lm, Finger.INDEX) < 50.0
 
 
-def is_index_curled(lm: np.ndarray) -> bool:
+def is_pen_up_pose(lm: np.ndarray) -> bool:
+    """Index + middle extended with ring and pinky curled."""
     if lm is None or lm.shape[0] < 21:
         return True
-    return float(lm[INDEX_TIP, 1]) >= float(lm[INDEX_PIP, 1])
+    return (
+        finger_extended(lm, Finger.INDEX)
+        and finger_extended(lm, Finger.MIDDLE)
+        and finger_curled(lm, Finger.RING)
+        and finger_curled(lm, Finger.PINKY)
+    )
 
 
-@dataclass
+@dataclass(frozen=True)
 class CompletedStroke:
-    """Screen-space tip polyline ready for the ONNX preprocessor (y will be flipped by caller)."""
-
-    points: np.ndarray  # (N, 2) float64 absolute normalized [0,1]
-    timestamps: np.ndarray  # (N,) perf_counter seconds
+    points: np.ndarray
+    timestamps: np.ndarray
+    strokes: tuple[np.ndarray, ...]
 
 
 @dataclass
 class StrokeCollector:
-    """Left-index tip trajectory FSM with noise rejection and neon preview trail."""
+    """Collect separated strokes and clear ink atomically on commit."""
 
     profile: HandProfile = field(default_factory=lambda: load_profile() or default_profile())
-    tip_filter: OneEuroFilter2D = field(default_factory=lambda: OneEuroFilter2D(1.2, 0.05))
+    tip_filter: OneEuroFilter2D = field(
+        default_factory=lambda: OneEuroFilter2D(1.2, 0.05)
+    )
     state: PenState = PenState.UP
-    _abs: list[tuple[float, float, float]] = field(default_factory=list)
-    _rel: list[tuple[float, float, float]] = field(default_factory=list)
-    _anchor: tuple[float, float] | None = None
-    _last_xy: tuple[float, float] | None = None
-    _last_t: float | None = None
-    _dwell_since: float | None = None
-    _fade_pts: list[tuple[float, float]] = field(default_factory=list)
-    _fade_until: float = 0.0
-    dwell_speed: float = DWELL_SPEED
+    current_stroke: list[tuple[float, float]] = field(default_factory=list)
+    letter_strokes: list[list[tuple[float, float]]] = field(default_factory=list)
+    letter_commit_timer: float | None = None
+    _active_timestamps: list[float] = field(default_factory=list)
+    _letter_timestamps: list[list[float]] = field(default_factory=list)
 
     def set_profile(self, profile: HandProfile) -> None:
         self.profile = profile
 
-    def reset(self, *, keep_fade: bool = False) -> None:
-        if keep_fade and len(self._abs) >= 2:
-            self._start_fade(time.perf_counter())
-        self._abs.clear()
-        self._rel.clear()
-        self._anchor = None
-        self._dwell_since = None
-        self.state = PenState.UP
-
-    def purge(self) -> None:
-        """Hard clear (gesture interruption) — no fade."""
-        self._abs.clear()
-        self._rel.clear()
-        self._anchor = None
-        self._dwell_since = None
-        self._fade_pts.clear()
-        self._fade_until = 0.0
-        self.state = PenState.UP
-        self.tip_filter.reset()
-
     @property
     def point_count(self) -> int:
-        return len(self._abs)
+        return len(self.current_stroke) + sum(
+            len(stroke) for stroke in self.letter_strokes
+        )
+
+    @property
+    def active_stroke(self) -> list[tuple[float, float]]:
+        """Compatibility alias for the discrete ink-clutch contract."""
+        return self.current_stroke
+
+    @property
+    def active_strokes(self) -> list[list[tuple[float, float]]]:
+        strokes = [*self.letter_strokes]
+        if self.current_stroke:
+            strokes.append(self.current_stroke)
+        return strokes
+
+    @property
+    def commit_timer(self) -> float | None:
+        """Compatibility alias for the 400 ms letter deadline."""
+        return self.letter_commit_timer
+
+    @commit_timer.setter
+    def commit_timer(self, value: float | None) -> None:
+        self.letter_commit_timer = value
 
     @property
     def is_drawing(self) -> bool:
@@ -121,45 +114,91 @@ class StrokeCollector:
 
     @property
     def trail_abs(self) -> list[tuple[float, float]]:
-        if self.state == PenState.FADING or (self._fade_pts and time.perf_counter() < self._fade_until):
-            return list(self._fade_pts)
-        return [(x, y) for x, y, _t in self._abs]
+        return [
+            point
+            for stroke in [*self.letter_strokes, self.current_stroke]
+            for point in stroke
+        ]
 
-    def _hand_scale(self, lm: np.ndarray | None) -> float:
-        if lm is not None and lm.shape[0] >= 21:
-            return live_hand_scale(lm)
-        return max(float(self.profile.palm_base_scale), 1e-4)
+    def _clear_canvas(self) -> None:
+        self.current_stroke = []
+        self.letter_strokes = []
+        self._active_timestamps = []
+        self._letter_timestamps = []
+        self.letter_commit_timer = None
+        self.state = PenState.UP
 
-    def _min_diagonal(self, lm: np.ndarray | None) -> float:
-        return 0.03 * self._hand_scale(lm)
+    def reset(self, *, keep_fade: bool = False) -> None:
+        del keep_fade
+        self._clear_canvas()
+        self.tip_filter.reset()
 
-    def _bbox_diagonal(self, pts: list[tuple[float, float, float]]) -> float:
-        if len(pts) < 2:
-            return 0.0
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        return float(np.hypot(max(xs) - min(xs), max(ys) - min(ys)))
+    def purge(self) -> None:
+        """Atomic command flush: active ink, completed ink, and timers vanish."""
+        self._clear_canvas()
+        self.tip_filter.reset()
 
-    def _start_fade(self, now: float) -> None:
-        self._fade_pts = [(x, y) for x, y, _t in self._abs]
-        self._fade_until = now + FADE_S
-        self.state = PenState.FADING
+    def _finish_active(self, now: float) -> None:
+        if len(self.current_stroke) > 2:
+            self.letter_strokes.append(self.current_stroke)
+            self._letter_timestamps.append(self._active_timestamps)
+        self.current_stroke = []
+        self._active_timestamps = []
+        self.state = PenState.UP
+        if self.letter_strokes:
+            self.letter_commit_timer = now + COMMIT_DELAY_S
 
-    def _emit_if_valid(self, now: float, lm: np.ndarray | None) -> CompletedStroke | None:
-        n = len(self._abs)
-        diag = self._bbox_diagonal(self._abs)
-        valid = n >= MIN_POINTS and diag >= self._min_diagonal(lm)
-        result: CompletedStroke | None = None
-        if valid:
-            pts = np.array([(x, y) for x, y, _t in self._abs], dtype=np.float64)
-            ts = np.array([t for _x, _y, t in self._abs], dtype=np.float64)
-            result = CompletedStroke(points=pts, timestamps=ts)
-        self._start_fade(now)
-        self._abs.clear()
-        self._rel.clear()
-        self._anchor = None
-        self._dwell_since = None
-        return result
+    def _commit(self) -> CompletedStroke | None:
+        strokes = tuple(
+            np.asarray(stroke, dtype=np.float64) for stroke in self.letter_strokes
+        )
+        timestamp_groups = tuple(
+            np.asarray(values, dtype=np.float64) for values in self._letter_timestamps
+        )
+
+        # Clear before returning so the preview cannot render stale ink while
+        # asynchronous inference is being queued or executed.
+        self._clear_canvas()
+        self.tip_filter.reset()
+        if not strokes:
+            return None
+
+        points = np.concatenate(strokes, axis=0)
+        timestamps = np.concatenate(timestamp_groups, axis=0)
+        return CompletedStroke(points, timestamps, strokes)
+
+    def _filtered_tip(self, lm: np.ndarray, now: float) -> tuple[float, float]:
+        return self.tip_filter(
+            float(lm[INDEX_TIP, 0]),
+            float(lm[INDEX_TIP, 1]),
+            now,
+        )
+
+    def begin_stroke(self, lm: np.ndarray, now: float) -> None:
+        self.state = PenState.DOWN
+        self.current_stroke = []
+        self._active_timestamps = []
+        self.letter_commit_timer = None
+        self.append_point(lm, now)
+
+    def append_point(self, lm: np.ndarray, now: float) -> None:
+        if self.state != PenState.DOWN:
+            self.begin_stroke(lm, now)
+            return
+        self.current_stroke.append(self._filtered_tip(lm, now))
+        self._active_timestamps.append(now)
+
+    def end_stroke(self, now: float) -> None:
+        if self.state == PenState.DOWN:
+            self._finish_active(now)
+
+    def commit_if_due(self, now: float) -> CompletedStroke | None:
+        if (
+            self.letter_commit_timer is not None
+            and now >= self.letter_commit_timer
+        ):
+            return self._commit()
+        return None
 
     def update(
         self,
@@ -169,99 +208,60 @@ class StrokeCollector:
         allow: bool,
         index_extended: bool | None = None,
     ) -> CompletedStroke | None:
-        """Advance collector. Returns a completed stroke once, then resets the buffer."""
-        if self.state == PenState.FADING and now >= self._fade_until:
-            self._fade_pts.clear()
-            self.state = PenState.UP
-
-        writing = is_index_writing_pose(lm) if lm is not None else False
-        if index_extended is True:
-            writing = True
-        curled = is_index_curled(lm) if lm is not None else True
-        tip_xy = (float(lm[INDEX_TIP, 0]), float(lm[INDEX_TIP, 1])) if lm is not None else (0.0, 0.0)
-
+        del index_extended
         if not allow:
-            if self.state == PenState.DOWN:
-                if curled:
-                    out = self._emit_if_valid(now, lm)
-                    self._last_xy = tip_xy
-                    self._last_t = now
-                    return out
-                self._start_fade(now)
-                self._abs.clear()
-                self._rel.clear()
-                self._anchor = None
-                self._dwell_since = None
-            self._last_xy = tip_xy
-            self._last_t = now
             return None
 
-        fx, fy = self.tip_filter(float(tip_xy[0]), float(tip_xy[1]), now)
-        speed = 0.0
-        if self._last_xy is not None and self._last_t is not None:
-            dt = max(now - self._last_t, 1e-4)
-            speed = float(np.hypot(fx - self._last_xy[0], fy - self._last_xy[1])) / dt
-        self._last_xy = (fx, fy)
-        self._last_t = now
+        writing_pose = is_index_writing_pose(lm)
+        pen_up_pose = is_pen_up_pose(lm)
 
-        if self.state != PenState.DOWN:
-            if writing:
-                self.state = PenState.DOWN
-                self._anchor = (fx, fy)
-                self._abs = [(fx, fy, now)]
-                self._rel = [(0.0, 0.0, now)]
-                self._dwell_since = None
-                self._fade_pts.clear()
+        if writing_pose:
+            if self.state != PenState.DOWN:
+                self.begin_stroke(lm, now)
+            else:
+                self.letter_commit_timer = None
+                self.append_point(lm, now)
             return None
 
-        assert self._anchor is not None
-        ax, ay = self._anchor
-        self._abs.append((fx, fy, now))
-        self._rel.append((fx - ax, fy - ay, now))
-        if len(self._abs) > 500:
-            self._abs = self._abs[-400:]
-            self._rel = self._rel[-400:]
+        if self.state == PenState.DOWN:
+            # Any departure from PEN_DOWN closes the stroke immediately. The
+            # explicit PEN_UP pose and hand-loss path are therefore gap-safe.
+            self._finish_active(now)
+        elif (
+            pen_up_pose
+            and self.letter_strokes
+            and self.letter_commit_timer is None
+        ):
+            self.letter_commit_timer = now + COMMIT_DELAY_S
 
-        if speed < self.dwell_speed:
-            if self._dwell_since is None:
-                self._dwell_since = now
-        else:
-            self._dwell_since = None
+        return self.commit_if_due(now)
 
-        dwell_done = self._dwell_since is not None and (now - self._dwell_since) >= DWELL_S
-        if dwell_done or curled:
-            return self._emit_if_valid(now, lm)
-        return None
+    def update_missing(self, now: float) -> CompletedStroke | None:
+        if self.state == PenState.DOWN:
+            self._finish_active(now)
+        elif self.letter_strokes and self.letter_commit_timer is None:
+            self.letter_commit_timer = now + COMMIT_DELAY_S
+        return self.commit_if_due(now)
 
     def draw_neon_trail(self, frame: np.ndarray) -> None:
-        """Antialiased neon green glow trail on the OpenCV preview frame."""
-        h, w = frame.shape[:2]
-        now = time.perf_counter()
-        fading = bool(self._fade_pts) and now < self._fade_until
-        pts_src = self._fade_pts if fading else [(x, y) for x, y, _t in self._abs]
-        if len(pts_src) < 1:
+        strokes = [*self.letter_strokes]
+        if self.current_stroke:
+            strokes.append(self.current_stroke)
+        if not strokes:
             return
 
-        alpha = 1.0
-        if fading:
-            alpha = max(0.0, (self._fade_until - now) / FADE_S)
-
-        pts = np.array([(int(x * w), int(y * h)) for x, y in pts_src], dtype=np.int32)
+        height, width = frame.shape[:2]
         overlay = frame.copy()
-
-        if len(pts) >= 2:
-            thickness_glow = max(int(10 * alpha), 2)
-            thickness_mid = max(int(6 * alpha), 2)
-            thickness_core = max(int(2 + 2 * alpha), 1)
-            cv2.polylines(overlay, [pts], False, NEON_SOFT, thickness_glow, cv2.LINE_AA)
-            cv2.polylines(overlay, [pts], False, NEON_GLOW, thickness_mid, cv2.LINE_AA)
-            cv2.polylines(overlay, [pts], False, NEON_CORE, thickness_core, cv2.LINE_AA)
-
-        tip = tuple(int(v) for v in pts[-1])
-        r_outer = max(int(14 * alpha), 3)
-        r_inner = max(int(6 * alpha), 2)
-        cv2.circle(overlay, tip, r_outer, NEON_SOFT, -1, cv2.LINE_AA)
-        cv2.circle(overlay, tip, r_inner + 2, NEON_GLOW, -1, cv2.LINE_AA)
-        cv2.circle(overlay, tip, r_inner, NEON_CORE, -1, cv2.LINE_AA)
-
-        cv2.addWeighted(overlay, 0.55 * alpha + 0.25, frame, 1.0 - (0.55 * alpha + 0.25), 0, frame)
+        for stroke in strokes:
+            points = np.asarray(
+                [(int(x * width), int(y * height)) for x, y in stroke],
+                dtype=np.int32,
+            )
+            if len(points) == 1:
+                cv2.circle(overlay, tuple(points[0]), 6, NEON_CORE, -1, cv2.LINE_AA)
+                continue
+            cv2.polylines(overlay, [points], False, NEON_SOFT, 10, cv2.LINE_AA)
+            cv2.polylines(overlay, [points], False, NEON_GLOW, 6, cv2.LINE_AA)
+            cv2.polylines(overlay, [points], False, NEON_CORE, 3, cv2.LINE_AA)
+            cv2.circle(overlay, tuple(points[-1]), 6, NEON_CORE, -1, cv2.LINE_AA)
+        cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)

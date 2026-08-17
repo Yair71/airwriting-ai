@@ -23,9 +23,14 @@ def _build_app(camera: int, preview: bool, mirror: bool):
     from src.autocompletion.trie_engine import GhostTextManager, TrieEngine
     from src.platform.focus_detector import ENABLE_FOCUS_GATING as FD_GATING
     from src.platform.focus_detector import FocusDetector
-    from src.platform.keyboard_layout import InputLang, charset_mask, layout_to_lang
+    from src.platform.keyboard_layout import InputLang, layout_to_lang
+    from src.platform.native_cursor import NativeCursor
     from src.platform.win_injector import WinInjector
-    from src.recognition.stroke_classifier import StrokeClassifier
+    from src.recognition.stroke_classifier import (
+        AsyncStrokeClassifier,
+        ClassificationResult,
+        StrokeClassifier,
+    )
     from src.ui.ghost_overlay import GhostOverlay
     from src.vision.dual_tracker import DualHandCallbacks, DualHandTracker
 
@@ -50,12 +55,15 @@ def _build_app(camera: int, preview: bool, mirror: bool):
         lang = InputLang.EN
     ghost = GhostTextManager(tries[lang])
     injector = WinInjector(require_text_focus=focus_gating)
+    cursor = NativeCursor()
     overlay = GhostOverlay()
     focus = FocusDetector(poll_hz=15.0)
     classifier = StrokeClassifier(
         onnx_path=root / "data" / "checkpoints" / "accurate_model.onnx",
         map_path=root / "configs" / "unistroke_map.json",
     )
+    async_classifier = AsyncStrokeClassifier(classifier)
+    pipeline_lock = threading.RLock()
     state = {"lang": lang, "preview": bool(preview)}
 
     def sync_overlay(focus_info=None) -> None:
@@ -95,105 +103,120 @@ def _build_app(camera: int, preview: bool, mirror: bool):
         refresh_lang()
         sync_overlay(info)
 
-    def on_stroke(points, timestamps=None) -> None:
-        """StrokeCollector → ONNX (lang-masked) → SendInput + Trie → GhostOverlay."""
+    def on_classification(result: ClassificationResult) -> None:
+        """Worker completion → immediate OS injection and trie update."""
+        with pipeline_lock:
+            label = result.label
+            conf = result.confidence
+            tracker.set_last_recognition(label, conf, flash=result.accepted)
+            if not result.accepted:
+                return
+            if label in {"SPACE", "BACKSPACE", "ENTER", "TAB"}:
+                if label == "SPACE":
+                    injector.space()
+                    ghost.clear()
+                elif label == "BACKSPACE":
+                    injector.backspace()
+                    ghost.pop_char()
+                elif label == "ENTER":
+                    injector.enter()
+                    ghost.clear()
+                elif label == "TAB":
+                    text = ghost.commit_tab()
+                    if text:
+                        injector.type_text(text)
+                    else:
+                        injector.tab()
+                    ghost.clear()
+            else:
+                injector.inject_label(label)
+                ch = label
+                if state["lang"] == InputLang.EN and len(ch) == 1 and ch.isalpha():
+                    ch = ch.lower()
+                ghost.append_char(ch)
+            sync_overlay()
+
+    def on_stroke(points, timestamps=None, strokes=None) -> None:
+        """Enqueue ONNX inference; return immediately to the camera loop."""
         if focus_gating and not injector.text_focused:
             return
         refresh_lang()
-        hit = classifier.recognize(points, lang=state["lang"], timestamps=timestamps)
-        if hit is None:
-            ranked = classifier.predict(
-                points,
-                top_k=1,
-                allowed=charset_mask(classifier.charset, state["lang"]),
-                timestamps=timestamps,
-            )
-            label, conf = ranked[0]
-            tracker.set_last_recognition(label, conf, flash=False)
-            return
-        label, conf = hit
-        tracker.set_last_recognition(label, conf, flash=True)
-        if label in {"SPACE", "BACKSPACE", "ENTER", "TAB"}:
-            if label == "SPACE":
-                injector.space()
-                ghost.clear()
-            elif label == "BACKSPACE":
-                injector.backspace()
-                ghost.pop_char()
-            elif label == "ENTER":
-                injector.enter()
-                ghost.clear()
-            elif label == "TAB":
-                text = ghost.commit_tab()
-                if text:
-                    injector.type_text(text)
-                else:
-                    injector.tab()
-                ghost.clear()
-        else:
-            injector.inject_label(label)
-            ch = label
-            if state["lang"] == InputLang.EN and len(ch) == 1 and ch.isalpha():
-                ch = ch.lower()
-            ghost.append_char(ch)
-        sync_overlay()
+        async_classifier.submit(
+            points,
+            lang=state["lang"],
+            timestamps=timestamps,
+            strokes=strokes,
+            on_complete=on_classification,
+        )
 
     def on_fist_tab() -> None:
         """Fist → commit GhostText suffix + trailing space (or raw TAB)."""
-        if focus_gating and not injector.text_focused:
-            return
-        tracker.set_last_recognition("TAB", 1.0)
-        text = ghost.commit_tab()
-        if text:
-            injector.type_text(text)
-        else:
-            injector.tab()
-        ghost.clear()
-        sync_overlay()
+        with pipeline_lock:
+            if focus_gating and not injector.text_focused:
+                return
+            tracker.set_last_recognition("TAB", 1.0)
+            text = ghost.commit_tab()
+            if text:
+                injector.type_text(text)
+            else:
+                injector.tab()
+            ghost.clear()
+            sync_overlay()
 
     def on_swipe_left() -> None:
-        if focus_gating and not injector.text_focused:
-            return
-        tracker.set_last_recognition("BACKSPACE", 1.0)
-        injector.backspace()
-        ghost.pop_char()
-        sync_overlay()
+        with pipeline_lock:
+            if focus_gating and not injector.text_focused:
+                return
+            tracker.set_last_recognition("BACKSPACE", 1.0)
+            injector.backspace()
+            ghost.pop_char()
+            sync_overlay()
 
     def on_swipe_right() -> None:
-        if focus_gating and not injector.text_focused:
-            return
-        tracker.set_last_recognition("SPACE", 1.0)
-        injector.space()
-        ghost.clear()
-        sync_overlay()
+        with pipeline_lock:
+            if focus_gating and not injector.text_focused:
+                return
+            tracker.set_last_recognition("SPACE", 1.0)
+            injector.space()
+            ghost.clear()
+            sync_overlay()
 
     def on_lang_switch() -> None:
-        injector.toggle_keyboard_layout()
-        refresh_lang()
-        tracker.set_last_recognition("LANG", 1.0)
-        sync_overlay()
+        with pipeline_lock:
+            injector.toggle_keyboard_layout()
+            refresh_lang()
+            tracker.set_last_recognition("LANG", 1.0)
+            sync_overlay()
 
     def on_enter() -> None:
-        if focus_gating and not injector.text_focused:
-            return
-        tracker.set_last_recognition("ENTER", 1.0)
-        injector.enter()
-        ghost.clear()
-        sync_overlay()
+        with pipeline_lock:
+            if focus_gating and not injector.text_focused:
+                return
+            tracker.set_last_recognition("ENTER", 1.0)
+            injector.enter()
+            ghost.clear()
+            sync_overlay()
 
     callbacks = DualHandCallbacks(
-        on_mouse_move=injector.move_pointer_norm,
-        on_left_down=injector.left_down,
-        on_left_up=injector.left_up,
-        on_right_down=injector.right_down,
-        on_right_up=injector.right_up,
-        on_scroll=injector.scroll,
+        on_mouse_move=cursor.move_pointer_norm,
+        on_mouse_position=cursor.position,
+        on_screen_size=cursor.screen_size,
+        on_left_down=cursor.left_down,
+        on_left_up=cursor.left_up,
+        on_right_down=cursor.right_down,
+        on_right_up=cursor.right_up,
+        on_left_click=cursor.left_click,
+        on_right_click=cursor.right_click,
+        on_scroll=cursor.scroll,
         on_stroke=on_stroke,
         on_fist_tab=on_fist_tab,
         on_swipe_left=on_swipe_left,
         on_swipe_right=on_swipe_right,
         on_lang_switch=on_lang_switch,
         on_enter=on_enter,
+        on_space=on_swipe_right,
+        on_backspace=on_swipe_left,
+        on_tab=on_fist_tab,
     )
     tracker = DualHandTracker(
         camera_index=camera,
@@ -238,8 +261,10 @@ def _build_app(camera: int, preview: bool, mirror: bool):
         "tries": {k.value: v.word_count for k, v in tries.items()},
         "ghost": ghost,
         "injector": injector,
+        "cursor": cursor,
         "overlay": overlay,
         "classifier": classifier,
+        "async_classifier": async_classifier,
         "tracker": tracker,
         "focus": focus,
         "lang": state,
@@ -260,6 +285,7 @@ def run_tray(camera: int = 0, preview: bool = False, mirror: bool = True) -> int
     app = _build_app(camera, preview, mirror)
     tracker = app["tracker"]
     overlay = app["overlay"]
+    async_classifier = app["async_classifier"]
     set_preview = app["set_preview"]
     state = app["state"]
     stop = threading.Event()
@@ -272,6 +298,7 @@ def run_tray(camera: int = 0, preview: bool = False, mirror: bool = True) -> int
                 if not tracker.step():
                     break
         finally:
+            async_classifier.close(wait=True)
             tracker.close()
             overlay.stop()
 
@@ -322,6 +349,7 @@ def run_headless(camera: int = 0, preview: bool = True, mirror: bool = True) -> 
     app = _build_app(camera, preview, mirror)
     overlay = app["overlay"]
     tracker = app["tracker"]
+    async_classifier = app["async_classifier"]
     stop = {"flag": False}
     panel: StopPanel | None = None
 
@@ -352,6 +380,7 @@ def run_headless(camera: int = 0, preview: bool = True, mirror: bool = True) -> 
         request_stop()
     finally:
         request_stop()
+        async_classifier.close(wait=True)
         tracker.close()
         overlay.stop()
         if panel is not None:
